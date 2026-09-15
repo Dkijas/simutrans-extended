@@ -58,9 +58,57 @@ jobs:
           artifactErrorsFailBuild: true
           commit: "${{ env.latest_sha }}"
           name: "Nightly #${{ env.latest_short_sha }}"
-          removeArtifacts: true
+          # removeArtifacts was true, which deleted every asset here and let
+          # each deploy job put its own back.  For a job that always succeeds
+          # that is the same thing as overwriting.  For one that can fail it is
+          # not: the asset simply disappears, and there is nothing to download
+          # until the next night.
+          #
+          # macOS signing can fail for reasons that have nothing to do with
+          # this project - the Apple notary service rejecting or stalling - and
+          # the whole point of publishing only what is signed is that nothing
+          # unsigned goes out in its place.  Deleting yesterday's signed
+          # download as well would turn "no new build today" into "no build at
+          # all", which is strictly worse for users and was never the intent.
+          #
+          # Every publisher below already replaces its own asset by name
+          # (upload-release-action with overwrite: true, gh release upload
+          # --clobber), so nothing goes stale in the normal case.  The one
+          # thing removeArtifacts did that overwriting does not is clear away
+          # names that are no longer produced at all, and the step after this
+          # does exactly that, from an explicit list.
+          removeArtifacts: false
           tag: "Nightly"
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The part of removeArtifacts worth keeping: an asset whose name this
+      # workflow no longer produces should not sit on the release for ever.
+      # Retiring a name is a deliberate act, so the list is explicit and
+      # anything absent from it is removed.
+      - name: Remove release assets this workflow no longer produces
+        if: env.outdated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          keep="linux.zip linux-sdl2.zip
+                windows.zip windows-sdl2.zip
+                macos.zip macos-sdl2.zip macos-intel.zip macos-sdl2-intel.zip
+                macos-signed.txt
+                simutrans-extended.zip"
+          removed=0
+          while read -r name; do
+            [ -n "$name" ] || continue
+            if grep -qx -- "$name" <<<"$(tr ' ' '\n' <<<"$keep" | sed '/^$/d')"; then
+              continue
+            fi
+            echo "removing obsolete release asset: $name"
+            gh release delete-asset Nightly "$name" \
+              --repo "${{ github.repository }}" --yes
+            removed=$((removed + 1))
+          done < <(gh release view Nightly --repo "${{ github.repository }}" \
+                     --json assets --jq '.assets[].name')
+          echo "obsolete assets removed: $removed"
       - name: Move the Nightly tag
         if: env.outdated == 'true'
         uses: actions/github-script@v7
@@ -109,14 +157,19 @@ jobs:
           server_artifact: simutrans-windows-posix
           makeobj_artifact: makeobj-windows
           nettool_artifact: nettool-windows
-        - os: macos
-          runner: macos-latest
-          backend: sdl3
-          zip_name: macos.zip
-          game_artifact: sim-mac-sdl3-nightly
-          server_artifact: sim-mac-posix-nightly
-          makeobj_artifact: makeobj-mac-nightly
-          nettool_artifact: nettool-mac-nightly
+        # macOS is NOT in this matrix any more.  It is built, signed with a
+        # Developer ID, notarized, stapled and published by the sign-macos job
+        # below, which calls .github/workflows/macos-sign-notarize.yml.
+        #
+        # It is not merely "the same packaging plus a signature".  The macOS
+        # entries here consumed ci.yml's artifacts, and those are arm64 only
+        # (macos-latest is an arm64 image) and declare a minimum of macOS 26.0,
+        # because nothing in ci.yml pins a deployment target.  The signed path
+        # builds from source on pinned runner images so that both
+        # architectures exist and the floor is a decision rather than an
+        # accident, and it produces an application bundle with the game data
+        # beside it instead of four bare executables.
+        #
         # SDL2 remains available under secondary asset names
         - os: linux
           runner: ubuntu-latest
@@ -135,14 +188,6 @@ jobs:
           server_artifact: simutrans-windows-posix
           makeobj_artifact: makeobj-windows
           nettool_artifact: nettool-windows
-        - os: macos
-          runner: macos-latest
-          backend: sdl2
-          zip_name: macos-sdl2.zip
-          game_artifact: sim-mac-sdl2-nightly
-          server_artifact: sim-mac-posix-nightly
-          makeobj_artifact: makeobj-mac-nightly
-          nettool_artifact: nettool-mac-nightly
     steps:
       - name: Get artifacts
         env:
@@ -171,109 +216,6 @@ jobs:
           cp ./artifacts/${{matrix.server_artifact}}/simutrans-extended${{matrix.suffix}} ./${{matrix.os}}/simutrans-extended-server${{matrix.suffix}}
           cp ./artifacts/${{matrix.makeobj_artifact}}/makeobj-extended${{matrix.suffix}} ./${{matrix.os}}/makeobj-extended${{matrix.suffix}}
           cp ./artifacts/${{matrix.nettool_artifact}}/nettool-extended${{matrix.suffix}} ./${{matrix.os}}/nettool-extended${{matrix.suffix}}
-
-      # The CI macOS binaries link against Homebrew dylibs; bundle them next to the
-      # executables (@executable_path/lib) and ad-hoc re-sign, so the binaries run on
-      # machines without Homebrew. Modified arm64 Mach-Os require a valid signature.
-      # Deliberately no dylibbundler: it prompts interactively for @rpath dependencies
-      # it cannot resolve and loops forever on CI.
-      - name: Bundle macOS dylibs
-        if: matrix.os == 'macos'
-        run: |
-          # The binaries reference Homebrew keg paths that only exist on the build
-          # runner; install the same formulae as the CI macOS jobs (ci.yml) so the
-          # dylibs can be resolved here.
-          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install freetype libpng fluidsynth ${{ matrix.backend }}
-          list_rpaths() {
-            otool -l "$1" | awk '/cmd LC_RPATH/{f=1; next} f && / path /{print $2; f=0}'
-          }
-          resolve_dep() {
-            # $1 = dependency as listed by otool -L, $2... = rpath dirs to search
-            local dep="$1"
-            local base rp
-            shift
-            case "$dep" in
-              @rpath/*)
-                base="${dep#@rpath/}"
-                for rp in "$@"; do
-                  if [[ -f "$rp/$base" ]]; then echo "$rp/$base"; return 0; fi
-                done
-                return 1
-                ;;
-              *)
-                [[ -f "$dep" ]] && { echo "$dep"; return 0; }
-                return 1
-                ;;
-            esac
-          }
-          bundle_lib() {
-            # Recursively bundle the non-system dependencies of an already-copied lib/ dylib.
-            # All variables must be local: the function recurses, and globals would be
-            # clobbered by the inner invocations (subtle mis-retargeting results).
-            local libfile="$1"
-            local bin_rpaths="$2"
-            local lrpaths ldeps ldep lreal lbase
-            lrpaths=$(list_rpaths "$libfile")
-            ldeps=$(otool -L "$libfile" | awk 'NR>1 {print $1}')
-            while read -r ldep; do
-              case "$ldep" in
-                /usr/lib/*|/System/*|@loader_path/*|@executable_path/*|"") continue ;;
-              esac
-              lreal=$(resolve_dep "$ldep" $lrpaths $bin_rpaths) || {
-                echo "::error::Cannot resolve dependency $ldep of $libfile"
-                exit 1
-              }
-              lbase=$(basename "$lreal")
-              if [[ ! -f "lib/$lbase" ]]; then
-                cp -L "$lreal" "lib/$lbase"
-                install_name_tool -id "@loader_path/$lbase" "lib/$lbase"
-                codesign --force --sign - "lib/$lbase"
-                bundle_lib "lib/$lbase" "$bin_rpaths"
-              fi
-              install_name_tool -change "$ldep" "@loader_path/$lbase" "$libfile"
-            done <<< "$ldeps"
-            codesign --force --sign - "$libfile"
-          }
-          bundle_binary() {
-            local bin="$1"
-            local rpaths deps dep real base
-            rpaths=$(list_rpaths "$bin")
-            deps=$(otool -L "$bin" | awk 'NR>1 {print $1}')
-            while read -r dep; do
-              case "$dep" in
-                /usr/lib/*|/System/*|@loader_path/*|@executable_path/*|"") continue ;;
-              esac
-              real=$(resolve_dep "$dep" $rpaths) || {
-                echo "::error::Cannot resolve dependency $dep of $bin"
-                exit 1
-              }
-              base=$(basename "$real")
-              if [[ ! -f "lib/$base" ]]; then
-                cp -L "$real" "lib/$base"
-                install_name_tool -id "@loader_path/$base" "lib/$base"
-                codesign --force --sign - "lib/$base"
-                bundle_lib "lib/$base" "$rpaths"
-              fi
-              install_name_tool -change "$dep" "@executable_path/lib/$base" "$bin"
-            done <<< "$deps"
-            codesign --force --sign - "$bin"
-          }
-          cd ./${{ matrix.os }}
-          mkdir -p lib
-          for bin in simutrans-extended simutrans-extended-server makeobj-extended nettool-extended; do
-            bundle_binary "$bin"
-          done
-          # Verification: no bundled file may reference Homebrew paths or unresolved @rpath entries
-          for bin in simutrans-extended simutrans-extended-server makeobj-extended nettool-extended lib/*; do
-            [[ -f "$bin" ]] || continue
-            if otool -L "$bin" | awk 'NR>1 {print $1}' | grep -qE '^(@rpath/|/opt/homebrew/|/usr/local/)'; then
-              echo "::error::$bin still references Homebrew or unresolved @rpath library paths:"
-              otool -L "$bin"
-              exit 1
-            fi
-            otool -L "$bin"
-          done
-
       - run: zip -r ./${{ matrix.zip_name }} ./${{matrix.os}}/
 
       - name: Deploy
@@ -284,6 +226,36 @@ jobs:
           tag: Nightly
           overwrite: true
           file_glob: true
+
+  # The macOS downloads: built from source, signed with a Developer ID,
+  # notarized, stapled, and attached to this same Nightly release.
+  #
+  # It is called with the commit check-updates chose and the CI run that made
+  # that choice legitimate, so the project's existing policy about what is fit
+  # to publish still decides WHICH commit; the called workflow only decides
+  # whether that commit can be signed and shipped.
+  #
+  # Deliberately not in deploy-package's `needs`: when the notary service
+  # rejects or stalls there is no new macOS download that night, and that must
+  # not stop simutrans-extended.zip, the Linux and Windows assets or the
+  # paksets from going out.  The previous signed macOS archives stay on the
+  # release untouched - see the removeArtifacts note in check-updates.
+  #
+  # It runs unattended: the macos-signing environment must have no required
+  # reviewers, or every night would wait for a human.
+  sign-macos:
+    name: macOS (signed)
+    needs: check-updates
+    if: needs.check-updates.outputs.outdated == 'true'
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/macos-sign-notarize.yml
+    with:
+      sha: ${{ needs.check-updates.outputs.latest_sha }}
+      ci_run_id: ${{ needs.check-updates.outputs.run_id }}
+      publish: true
+    secrets: inherit
 
   update-paks:
     runs-on: ubuntu-latest

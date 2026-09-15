@@ -1,0 +1,1354 @@
+#
+# Build, sign with Developer ID and notarize the Simutrans-Extended macOS
+# application for direct distribution (that is, outside the Mac App Store).
+#
+# It runs in two modes, and they are not the same thing:
+#
+#   workflow_call      the nightly path.  nightly.yml calls this with the
+#                      commit its own check-updates job selected, builds all
+#                      four variants, signs, notarizes, staples and REPLACES
+#                      the macOS archives on the Nightly release.
+#   workflow_dispatch  builds whatever was asked for and stops at a verified
+#                      archive.  It publishes nothing, whatever the inputs say.
+#
+# WHY THIS IS CALLED BY THE NIGHTLY AND NOT TRIGGERED BY A PUSH
+# -------------------------------------------------------------
+# Simutrans Standard signs on every push to master, because master is what its
+# nightly publishes.  Extended does not work that way: nightly.yml picks the
+# head of the most recent SUCCESSFUL ci.yml run on master, which is not
+# necessarily the tip, and that selection is the project's policy about what
+# is fit to publish.  Signing every push would quietly replace that policy
+# with a different one.  So the nightly keeps deciding WHICH commit, and this
+# workflow decides only whether that commit can be signed and shipped.
+#
+# TWO RUN IDENTITIES
+# ------------------
+# There are two runs in play here and confusing them is the mistake this
+# workflow is built to make impossible.
+#
+#   ci_run_id       the CI run whose success made the commit eligible.  It
+#                   lives in another workflow, at another time.  It is the
+#                   authority for WHICH COMMIT, and for nothing else.  It is
+#                   checked here against GitHub's own record: same repository,
+#                   ci.yml, branch master, conclusion success, and a head_sha
+#                   equal to the commit we were asked to sign.
+#   github.run_id   this run.  It is the source of the BYTES that get signed:
+#                   every artifact the signing job consumes was produced by a
+#                   job of this same run, resolved by artifact id.
+#
+# No check ever compares one of those to the other.  Deliberately, this
+# workflow does NOT download the macOS binaries from the CI run, even though
+# the unsigned nightly does.  Three measured reasons:
+#
+#   * ci.yml runs its macOS jobs on macos-latest, which today is an arm64
+#     macOS 26 image.  There is no x86_64 macOS build of Extended in CI at all,
+#     so half of what has to be signed does not exist there.
+#   * nothing in ci.yml pins CMAKE_OSX_DEPLOYMENT_TARGET, so every Mach-O in
+#     the published macos.zip declares a minimum of macOS 26.0 - measured on
+#     the bytes of the 2026-09-14 nightly, not inferred.
+#   * CI uploads the bare executable and never the install tree, and an
+#     application bundle needs the data that goes beside it.
+#
+# Building here also keeps the arrangement Standard proved: the job that holds
+# the signing identity consumes only data, never source, and never builds.
+#
+# WHAT AUTOMATIC SIGNING COSTS
+# ----------------------------
+# Every commit the nightly selects is signed with a real Developer ID without
+# anyone looking at it first.  That is the feature and it is the whole of the
+# risk: the identity is applied to whatever passed CI, and the developer whose
+# certificate it is answers for it.  Apple can revoke a Developer ID, and the
+# account with it.
+#
+# What is left once the human gate is gone:
+#   * only this repository, checked explicitly;
+#   * only a commit on master's history, resolved to a full SHA;
+#   * only a commit whose own ci.yml run succeeded, checked against the API;
+#   * only through the macos-signing environment, whose deployment branch
+#     policy is master;
+#   * the payload check, which still runs before the identity is loaded.
+# None of those inspect what the code does.  They establish where it came
+# from, which is a different and much weaker question.  A wait timer on the
+# environment is what buys a window to cancel; that is a setting, not code.
+#
+# A second consequence, and it is not hypothetical: when the notary service
+# rejects or stalls, there is no new macOS nightly that day.  Publishing only
+# what is signed means publishing nothing when signing does not finish.  What
+# it does NOT mean, here, is that macOS users are left with nothing: this
+# workflow never deletes the previous download, so yesterday's signed archive
+# stays where it is.  See the removeArtifacts note in nightly.yml.
+#
+# TRUST BOUNDARIES
+# ----------------
+# * It never runs on a pull request, and pull_request_target is not used
+#   anywhere: running a contributor's code with the signing identity is
+#   exactly the accident this layout is meant to make impossible.
+# * The signing job takes only data from the build jobs, never code, and never
+#   checks out the product's source at all.  Its scripts come from the ref the
+#   run was started from - the default branch for the nightly - not from the
+#   revision being signed.  A revision is a thing to sign, not a thing that
+#   gets to define how signing works.
+# * That data is checked before the identity is loaded: check-payload.sh
+#   rejects escaping symlinks, setuid files and any Mach-O outside the bundle
+#   while the Developer ID is still nowhere near the machine.
+#
+# NOTE: GitHub only offers workflow_dispatch for a workflow that exists on the
+# repository's default branch, so this cannot be exercised from a pull
+# request.  It has to reach master first.
+#
+# See .github/macos/README.md for the secrets a maintainer has to configure
+# and for how to run this.
+#
+name: macOS signed build (Developer ID)
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: 'Full 40-character commit the nightly selected.'
+        required: true
+        type: string
+      ci_run_id:
+        description: 'The ci.yml run whose success made that commit eligible.'
+        required: true
+        type: string
+      publish:
+        description: 'Attach the signed archives to the Nightly release.'
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit to sign. Must be on master history. Empty = the ref this run was started from.'
+        required: false
+        type: string
+        default: ''
+      architecture:
+        description: 'Which architecture to produce'
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - arm64
+          - x86_64
+      backend:
+        description: 'Which backend to produce'
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - sdl3
+          - sdl2
+      upload_artifact:
+        description: 'Upload the signed archive as a workflow artifact. WARNING: this repository is public, so anyone able to read it can download that artifact.'
+        required: false
+        type: boolean
+        default: false
+      # Two separate questions, deliberately not one input.
+      #
+      # "Is this revision one we are allowed to sign at all?" is a trust
+      # question, answered by allow_unmerged.
+      # "Is what comes out meant to be given to anyone?" is a question of
+      # intent, answered by rehearsal.
+      #
+      # Folding them together would mean a rehearsal could only be had by
+      # picking an off-master commit, which is the wrong reason to choose a
+      # revision, and would let "it is only a rehearsal" become a way to sign
+      # code that has not been accepted.
+      rehearsal:
+        description: 'This run is a rehearsal: mark the result NOT-FOR-DISTRIBUTION. On by default. It is signed with a real identity either way.'
+        required: false
+        type: boolean
+        default: true
+      allow_unmerged:
+        description: 'TRUST EXCEPTION: permit a commit that is not on master history. Requires the full 40-character SHA in ref.'
+        required: false
+        type: boolean
+        default: false
+      retention:
+        description: 'required = stop before signing if the archive cannot be preserved. none = sign anyway, accepting that a verdict arriving after the run cannot be used.'
+        required: true
+        type: choice
+        default: required
+        options:
+          - required
+          - none
+
+# Least privilege by default; jobs do not widen it.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide, once, exactly which commit this run is about, refuse revisions that
+  # are not part of this repository's history, and check the CI run that is
+  # being cited as the authority for choosing it.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve and authorise the revision
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+      revision_id: ${{ steps.revision.outputs.revision_id }}
+      distribution_ok: ${{ steps.revision.outputs.distribution_ok }}
+      not_for_distribution: ${{ steps.revision.outputs.not_for_distribution }}
+      publish: ${{ steps.revision.outputs.publish }}
+      retention: ${{ steps.revision.outputs.retention }}
+      mode: ${{ steps.revision.outputs.mode }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tools_matrix: ${{ steps.matrix.outputs.tools_matrix }}
+    steps:
+      - name: Checkout
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          # The ancestry check below is the whole point of this job, and it
+          # cannot be done on a shallow clone.
+          fetch-depth: 0
+
+      - name: Resolve the revision and check it is one we may sign
+        id: revision
+        env:
+          # Present only on a workflow_call.  Its emptiness is what tells the
+          # two modes apart: github.event_name is the CALLER's event for a
+          # reusable workflow, so on the nightly path it reads 'schedule', not
+          # 'workflow_call', and cannot be used for this.
+          CALL_SHA: ${{ inputs.sha }}
+          CALL_PUBLISH: ${{ inputs.publish }}
+          DISPATCH_REF: ${{ inputs.ref }}
+          DISPATCH_REHEARSAL: ${{ inputs.rehearsal }}
+          DISPATCH_ALLOW_UNMERGED: ${{ inputs.allow_unmerged }}
+          DISPATCH_RETENTION: ${{ inputs.retention }}
+          EVENT: ${{ github.event_name }}
+          THIS_REF_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$CALL_SHA" ]; then
+            mode=nightly
+          else
+            mode=dispatch
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "mode: $mode (caller event: $EVENT)"
+
+          if [ "$mode" = nightly ]; then
+            # The nightly hands over a full SHA it resolved itself.  Anything
+            # else is a caller bug and must not be guessed at.
+            if ! grep -qE '^[0-9a-f]{40}$' <<<"$CALL_SHA"; then
+              echo "::error::the caller passed sha='$CALL_SHA', which is not a full 40-character commit."
+              exit 1
+            fi
+            sha=$CALL_SHA
+            allow_unmerged=false
+            rehearsal=false
+            # A push carries no inputs, and retention must never silently
+            # become "none" just because nobody was there to choose it.
+            retention=required
+          else
+            ref=${DISPATCH_REF:-$THIS_REF_SHA}
+            if ! sha=$(git rev-parse --verify "$ref^{commit}" 2>/dev/null); then
+              echo "::error::'$ref' does not name a commit in this repository."
+              exit 1
+            fi
+            allow_unmerged=$DISPATCH_ALLOW_UNMERGED
+            rehearsal=$DISPATCH_REHEARSAL
+            retention=$DISPATCH_RETENTION
+          fi
+
+          echo "resolved commit : $sha"
+
+          # Carrying a tag grants nothing.  The Nightly tag is moved to
+          # whatever the nightly last selected and is not a statement that a
+          # commit may be signed; only being on master's history is.
+          on_master=false
+          if git merge-base --is-ancestor "$sha" origin/master 2>/dev/null; then
+            on_master=true
+          fi
+          echo "on master history: $on_master"
+
+          if [ "$on_master" != true ]; then
+            if [ "$allow_unmerged" != true ]; then
+              echo "::error::$sha is not on master's history."
+              echo "::error::Signing it needs allow_unmerged, and that is a trust exception:"
+              echo "::error::it signs code the project has not accepted."
+              exit 1
+            fi
+            if [ "$mode" = nightly ]; then
+              echo "::error::the nightly path never accepts an unmerged commit."
+              exit 1
+            fi
+            if ! grep -qE '^[0-9a-f]{40}$' <<<"${DISPATCH_REF:-}"; then
+              echo "::error::allow_unmerged requires the full 40-character SHA in 'ref',"
+              echo "::error::so that the exception is asked for by name and not by branch."
+              exit 1
+            fi
+            echo "::warning::signing a commit that is not on master's history, by explicit request."
+          fi
+
+          # The project's own identity for a build: SimutransPack.cmake uses
+          # "<short sha>-nightly" and the release is titled "Nightly #<short
+          # sha>".  There is no git-svn-id in this repository and no SVN
+          # revision to carry; the commit is the revision.
+          revision_id=$(git rev-parse --short=9 "$sha")
+          echo "revision_id=$revision_id" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          # A rehearsal is signed for real; the marking is a label for humans.
+          if [ "$rehearsal" = true ] || [ "$on_master" != true ]; then
+            echo "distribution_ok=false" >> "$GITHUB_OUTPUT"
+            echo "not_for_distribution=true" >> "$GITHUB_OUTPUT"
+            distribution_ok=false
+          else
+            echo "distribution_ok=true" >> "$GITHUB_OUTPUT"
+            echo "not_for_distribution=false" >> "$GITHUB_OUTPUT"
+            distribution_ok=true
+          fi
+
+          # Publishing is the nightly path and only the nightly path.  A
+          # dispatch cannot reach it however its inputs are set.
+          if [ "$mode" = nightly ] && [ "$CALL_PUBLISH" = true ] && [ "$distribution_ok" = true ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          case "$retention" in
+            required|none) ;;
+            *) echo "::error::unknown retention '$retention'"; exit 1 ;;
+          esac
+          echo "retention=$retention" >> "$GITHUB_OUTPUT"
+
+      # The CI run is cited as the reason this commit may be published.  That
+      # claim is checked against GitHub's record of the run, not taken on
+      # trust, and it is checked for being about THIS commit - which is the
+      # only thing the CI run is allowed to decide here.
+      - name: Check the CI run that authorised this commit
+        if: steps.revision.outputs.mode == 'nightly'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          SHA: ${{ steps.revision.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! grep -qE '^[0-9]{1,20}$' <<<"$CI_RUN_ID"; then
+            echo "::error::ci_run_id='$CI_RUN_ID' is not a run id."
+            exit 1
+          fi
+
+          run=$(gh api "repos/${{ github.repository }}/actions/runs/$CI_RUN_ID")
+          get() { jq -r "$1" <<<"$run"; }
+
+          echo "ci run       : $CI_RUN_ID"
+          echo "repository   : $(get .repository.full_name)"
+          echo "workflow     : $(get .path)"
+          echo "branch       : $(get .head_branch)"
+          echo "head_sha     : $(get .head_sha)"
+          echo "conclusion   : $(get .conclusion)"
+          echo "attempt      : $(get .run_attempt)"
+
+          fail=0
+          check() {
+            local what=$1 want=$2 got=$3
+            if [ "$got" != "$want" ]; then
+              echo "::error::the cited CI run's $what is '$got', expected '$want'."
+              fail=1
+            fi
+          }
+          check repository "${{ github.repository }}" "$(get .repository.full_name)"
+          check workflow   '.github/workflows/ci.yml' "$(get .path)"
+          check branch     master "$(get .head_branch)"
+          check conclusion success "$(get .conclusion)"
+          check head_sha   "$SHA" "$(get .head_sha)"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the CI run cited as authority for signing $SHA does not"
+            echo "::error::support that claim.  Refusing to build or sign anything."
+            exit 1
+          fi
+          echo "the cited CI run is a successful master ci.yml run for exactly this commit"
+
+      - name: Build the job matrix
+        id: matrix
+        env:
+          MODE: ${{ steps.revision.outputs.mode }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+          BACKEND: ${{ inputs.backend }}
+        run: |
+          set -euo pipefail
+          # The nightly path always produces all four, because all four are
+          # published.
+          if [ "$MODE" = nightly ]; then
+            ARCHITECTURE=both
+            BACKEND=both
+          fi
+
+          # macos-15 and macos-15-intel are standard GitHub-hosted runners,
+          # free and unlimited on public repositories.  No larger runner label
+          # is used anywhere in this workflow, so it cannot incur a charge.
+          #
+          # They are pinned rather than using macos-latest on purpose.  Nothing
+          # in this project sets a deployment target, so the minimum macOS
+          # version of the product is whatever the runner's SDK and the
+          # Homebrew bottles default to.  Following macos-latest is how the
+          # current unsigned nightly ended up requiring macOS 26.0 without
+          # anyone deciding that.  Note that GitHub still updates the contents
+          # of a pinned image, which is why the floor is MEASURED after the
+          # build rather than asserted here.
+          case "$ARCHITECTURE" in
+            arm64)  arches='"arm64"' ;;
+            x86_64) arches='"x86_64"' ;;
+            both)   arches='"arm64","x86_64"' ;;
+            *) echo "::error::unknown architecture '$ARCHITECTURE'"; exit 1 ;;
+          esac
+          case "$BACKEND" in
+            sdl3)  backends='"sdl3"' ;;
+            sdl2)  backends='"sdl2"' ;;
+            both)  backends='"sdl3","sdl2"' ;;
+            *) echo "::error::unknown backend '$BACKEND'"; exit 1 ;;
+          esac
+
+          # The public asset names.  macos.zip and macos-sdl2.zip already exist
+          # and already mean "SDL3, Apple Silicon" and "SDL2, Apple Silicon";
+          # they keep those meanings so that every link people have keeps
+          # working and starts resolving to a signed file.  Intel is new and
+          # gets new names rather than changing what an existing name means.
+          matrix=$(jq -cn --argjson arches "[$arches]" --argjson backends "[$backends]" '
+            [ $arches[] as $a
+            | $backends[] as $b
+            | { arch: $a,
+                backend: $b,
+                runner: (if $a == "arm64" then "macos-15" else "macos-15-intel" end),
+                asset: ( (if $b == "sdl2" then "macos-sdl2" else "macos" end)
+                       + (if $a == "x86_64" then "-intel" else "" end)
+                       + ".zip" ) } ]')
+          tools=$(jq -cn --argjson arches "[$arches]" '
+            [ $arches[] as $a
+            | { arch: $a,
+                runner: (if $a == "arm64" then "macos-15" else "macos-15-intel" end) } ]')
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "tools_matrix=$tools" >> "$GITHUB_OUTPUT"
+          jq . <<<"$matrix"
+
+  # ---------------------------------------------------------------------------
+  # The three command-line tools, once per architecture.
+  #
+  # They are built from the headless configuration, which is what the server
+  # is, and they are shared by both backend variants: nothing in makeobj,
+  # nettool or the server depends on SDL.  Building them here rather than in
+  # each game job saves a whole engine compile per architecture.
+  #
+  # No credentials of any kind are available in this job.
+  # ---------------------------------------------------------------------------
+  build-tools:
+    name: Tools ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.tools_matrix) }}
+    steps:
+      # Two checkouts, because two different questions have two different
+      # answers.  WHAT IS BUILT is the revision the resolve job authorised.
+      # WHAT DOES THE BUILDING is this workflow and the scripts beside it,
+      # which come from the ref the run was started from.
+      - name: Checkout the revision to build
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+
+      - name: Checkout the packaging scripts
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          path: ci
+          sparse-checkout: .github/macos
+          sparse-checkout-cone-mode: false
+
+      - name: Record the toolchain
+        run: |
+          set -euo pipefail
+          {
+            echo "runner image : ${{ matrix.runner }}"
+            echo "arch         : $(uname -m)"
+            echo "macOS        : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            echo "Xcode        : $(xcodebuild -version | tr '\n' ' ')"
+            echo "SDK          : $(xcrun --show-sdk-version)"
+            echo "clang        : $(clang --version | head -1)"
+            echo "cmake        : $(cmake --version | head -1)"
+          } | tee toolchain.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+            brew install cmake freetype libpng pkg-config fluidsynth zstd
+
+      - name: Build the server, makeobj and nettool
+        working-directory: source
+        env:
+          # Chosen rather than inherited.  Left unset the floor is whatever the
+          # runner's SDK happens to default to, which is how the unsigned
+          # nightly reached macOS 26.0.  This only sets the floor for code
+          # compiled here; the Homebrew libraries carry their own, so the
+          # number that matters is the effective minimum measured later.
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: |
+          set -euo pipefail
+          # cmake is run from inside the checkout on purpose.
+          # cmake/SimutransCommitInfo.cmake calls `git rev-parse` with no
+          # WORKING_DIRECTORY, so it reads the process's current directory.
+          # Configuring from the workspace root would stamp the binary with
+          # whatever repository happened to be there, or with nothing at all.
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSIMUTRANS_BACKEND=none \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            2>&1 | tee ../configure-tools.log
+          cmake --build build --target simutrans-extended -j"$(sysctl -n hw.logicalcpu)"
+          cmake --build build --target makeobj-extended  -j"$(sysctl -n hw.logicalcpu)"
+          cmake --build build --target nettool-extended  -j"$(sysctl -n hw.logicalcpu)"
+
+      - name: Check the binaries carry the revision they should
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # SimutransCommitInfo.cmake compiles REVISION=<short 7> into the
+          # executable, and it reads it from cmake's working directory.  If
+          # that ever resolves elsewhere the build is silently mislabelled, so
+          # what it actually found is checked against what was asked for.
+          want=${SHA:0:7}
+          line=$(grep -F 'Configuring Simutrans-Extended (commit' configure-tools.log || true)
+          echo "cmake said: ${line:-<nothing>}"
+          if [ -z "$line" ]; then
+            echo "::error::cmake never reported the commit; SIMUTRANS_WITH_REVISION did not resolve."
+            exit 1
+          fi
+          if ! grep -qF "commit $want " <<<"$line"; then
+            echo "::error::the build was stamped with a different commit than $want."
+            exit 1
+          fi
+          echo "revision stamp confirmed: $want"
+
+      - name: Collect the tools
+        run: |
+          set -euo pipefail
+          mkdir -p out/tools
+          # The headless build of the game IS the dedicated server; it is
+          # given the name the packages have always used for it.
+          cp source/build/simutrans/simutrans-extended out/tools/simutrans-extended-server
+          cp source/build/makeobj/makeobj-extended     out/tools/makeobj-extended
+          cp source/build/nettools/nettool-extended    out/tools/nettool-extended
+          chmod 0755 out/tools/*
+          ls -l out/tools
+
+      - name: Record provenance
+        run: |
+          set -euo pipefail
+          # The job that consumes this re-reads these and refuses a bundle that
+          # did not come from this run, this commit and this architecture.
+          cat > out/provenance.json <<PROVENANCE
+          {
+            "repository": "${{ github.repository }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "workflow_ref": "${{ github.workflow_ref }}",
+            "sha": "${{ needs.resolve.outputs.sha }}",
+            "arch": "${{ matrix.arch }}",
+            "runner": "${{ matrix.runner }}",
+            "kind": "tools",
+            "revision_id": "${{ needs.resolve.outputs.revision_id }}"
+          }
+          PROVENANCE
+          cat out/provenance.json
+          cp toolchain.txt out/
+
+      - name: Upload the tools
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tools-${{ matrix.arch }}
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The game, and the bundle that will be signed: one per architecture and
+  # backend.  Still no credentials of any kind.
+  # ---------------------------------------------------------------------------
+  build-game:
+    name: Build ${{ matrix.arch }} ${{ matrix.backend }}
+    needs: [resolve, build-tools]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Checkout the revision to build
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+
+      - name: Checkout the packaging scripts
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          path: ci
+          sparse-checkout: .github/macos
+          sparse-checkout-cone-mode: false
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          # The same formulae ci.yml installs for the matching macOS job, so
+          # the signed build is the same product and not a different one.
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+            brew install cmake freetype libpng pkg-config fluidsynth zstd ${{ matrix.backend }}
+
+      - name: Build
+        working-directory: source
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: |
+          set -euo pipefail
+          # See the note in the tools job: cmake is run from inside the
+          # checkout so that the revision stamp comes from this repository.
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSIMUTRANS_BACKEND=${{ matrix.backend }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            2>&1 | tee ../configure-game.log
+          cmake --build build --target simutrans-extended -j"$(sysctl -n hw.logicalcpu)"
+
+      - name: Check the binary carries the revision it should
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          want=${SHA:0:7}
+          line=$(grep -F 'Configuring Simutrans-Extended (commit' configure-game.log || true)
+          echo "cmake said: ${line:-<nothing>}"
+          if [ -z "$line" ]; then
+            echo "::error::cmake never reported the commit; SIMUTRANS_WITH_REVISION did not resolve."
+            exit 1
+          fi
+          if ! grep -qF "commit $want " <<<"$line"; then
+            echo "::error::the build was stamped with a different commit than $want."
+            exit 1
+          fi
+          echo "revision stamp confirmed: $want"
+
+      - name: Install the data tree
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # This is what puts config/, font/, text/, themes/, script/, music/
+          # and get_pak.sh beside the executable.  ci.yml never does this - it
+          # uploads the bare binary - which is why the current macos.zip has no
+          # game data in it at all.
+          cmake --install build --prefix "$GITHUB_WORKSPACE/stage"
+          find "$GITHUB_WORKSPACE/stage" -maxdepth 2 -mindepth 1 | sort | head -40
+
+      - name: Resolve the tools build to one artifact
+        id: tools_artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chmod +x ci/.github/macos/*.sh
+          ci/.github/macos/resolve-artifact.sh \
+            "${{ github.repository }}" "${{ github.run_id }}" "tools-${{ matrix.arch }}" >/dev/null
+
+      - name: Download the tools from this run
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ steps.tools_artifact.outputs.id }}
+          path: incoming-tools
+          merge-multiple: true
+
+      - name: Verify where the tools came from
+        run: |
+          set -euo pipefail
+          ci/.github/macos/verify-provenance.sh \
+            incoming-tools/provenance.json \
+            --attempt "${{ github.run_attempt }}" \
+            "repository=${{ github.repository }}" \
+            "run_id=${{ github.run_id }}" \
+            "sha=${{ needs.resolve.outputs.sha }}" \
+            "arch=${{ matrix.arch }}" \
+            "kind=tools" \
+            "revision_id=${{ needs.resolve.outputs.revision_id }}"
+          chmod 0755 incoming-tools/tools/*
+
+      - name: Assemble the application bundle
+        run: |
+          set -euo pipefail
+          ci/.github/macos/make-bundle.sh \
+            --install-root "$GITHUB_WORKSPACE/stage" \
+            --tools-dir "$GITHUB_WORKSPACE/incoming-tools/tools" \
+            --icon "$GITHUB_WORKSPACE/source/OSX/simutrans.icns" \
+            --backend "${{ matrix.backend }}" \
+            --arch "${{ matrix.arch }}" \
+            --commit "${{ needs.resolve.outputs.sha }}" \
+            --revision "${{ needs.resolve.outputs.revision_id }}" \
+            --out "$GITHUB_WORKSPACE/payload"
+
+      - name: Inspect the bundle
+        run: |
+          set -euo pipefail
+          ci/.github/macos/inspect-bundle.sh \
+            payload/simutrans/simutrans-extended.app \
+            "${{ matrix.arch }}" \
+            macho-inventory.txt \
+            bundle-facts.txt
+
+      - name: Record the inputs that went into this build
+        run: |
+          set -euo pipefail
+          # What is and is not reproducible about this build.
+          #
+          # Unlike Simutrans Standard, nothing here is fetched from a
+          # translation server at build time: the language files come from
+          # simutrans/text/ in the checkout, so they are pinned by the commit.
+          # The Homebrew bottles are the mutable part, and they are recorded
+          # rather than pinnable.
+          {
+            echo "# Build inputs for ${{ needs.resolve.outputs.sha }} (${{ matrix.arch }}, ${{ matrix.backend }})"
+            echo "revision_id=${{ needs.resolve.outputs.revision_id }}"
+            echo "deployment_target_requested=13.0"
+            echo
+            echo "# Homebrew packages actually installed (mutable upstream, not pinnable here)"
+            brew list --versions cmake freetype libpng pkg-config fluidsynth zstd ${{ matrix.backend }} || true
+            echo
+            echo "# Bundle facts measured after the build"
+            cat bundle-facts.txt
+          } | tee build-inputs.txt
+
+      - name: Package the unsigned payload
+        id: package
+        run: |
+          set -euo pipefail
+          # ditto, not zip: the payload carries permissions and possibly
+          # symlinks that `zip -r` flattens, and a GitHub artifact would lose
+          # them too - which is why what gets uploaded is this archive as a
+          # single file rather than the directory tree.
+          #
+          # Counted inside the BUNDLE, not across the whole payload.  verify.sh
+          # checks the round trip with `find "$app" -type l`, and Extended's
+          # payload has a data tree beside the bundle where Standard's had
+          # nothing - so counting the payload would compare two different
+          # populations and fail on any symlink in config/ or text/.
+          symlinks=$(find payload/simutrans/simutrans-extended.app -type l | wc -l | tr -d ' ')
+          echo "symlinks=$symlinks" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          /usr/bin/ditto -c -k --keepParent payload/simutrans \
+            "out/simutrans-extended-${{ matrix.arch }}-${{ matrix.backend }}-unsigned.zip"
+          ls -l out
+
+      - name: Record provenance
+        env:
+          SYMLINKS: ${{ steps.package.outputs.symlinks }}
+        run: |
+          set -euo pipefail
+          cat > out/provenance.json <<PROVENANCE
+          {
+            "repository": "${{ github.repository }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "workflow_ref": "${{ github.workflow_ref }}",
+            "sha": "${{ needs.resolve.outputs.sha }}",
+            "arch": "${{ matrix.arch }}",
+            "backend": "${{ matrix.backend }}",
+            "runner": "${{ matrix.runner }}",
+            "kind": "bundle",
+            "symlinks": "$SYMLINKS",
+            "revision_id": "${{ needs.resolve.outputs.revision_id }}",
+            "distribution_ok": "${{ needs.resolve.outputs.distribution_ok }}",
+            "not_for_distribution": "${{ needs.resolve.outputs.not_for_distribution }}"
+          }
+          PROVENANCE
+          cat out/provenance.json
+          cp macho-inventory.txt bundle-facts.txt build-inputs.txt out/
+
+      - name: Upload the unsigned bundle
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: unsigned-${{ matrix.arch }}-${{ matrix.backend }}
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Sign and notarize.  This is the only job that sees a credential.
+  # ---------------------------------------------------------------------------
+  sign:
+    name: Sign ${{ matrix.arch }} ${{ matrix.backend }}
+    needs: [resolve, build-game]
+    # The canonical repository only.  A fork that copies this workflow has no
+    # secrets anyway, but failing here is clearer than failing at `security`.
+    if: github.repository == 'jamespetts/simutrans-extended'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Read-only, and only so this job can confirm that the preserved archive
+      # really was stored before anything is sent to Apple.
+      actions: read
+    # The environment is what gates access to the identity: a job that
+    # references one must satisfy its rules before it can read its secrets.
+    #
+    # For the nightly path to run unattended, that environment must NOT have
+    # required reviewers - otherwise every night waits for a human and nothing
+    # is ever published.  Removing them is the deliberate cost of automatic
+    # signing, and what is left is the deployment branch policy (master only)
+    # plus, if configured, a wait timer that gives a window to cancel a run
+    # before the identity is used.
+    environment: macos-signing
+    # Signing runs are serialised per variant, and a run in flight is never
+    # cancelled: a cancellation between the notary verdict and the stapling
+    # step would leave a half-processed bundle behind.
+    concurrency:
+      group: macos-sign-${{ matrix.arch }}-${{ matrix.backend }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Check the signing configuration is complete
+        # Fails in seconds when something is missing, rather than after a build
+        # and a partial signature.
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_P12_PASSWORD }}
+          MACOS_NOTARY_API_KEY_P8: ${{ secrets.MACOS_NOTARY_API_KEY_P8 }}
+          MACOS_NOTARY_API_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          MACOS_NOTARY_API_ISSUER_ID: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_P12_PASSWORD \
+                      MACOS_NOTARY_API_KEY_P8 MACOS_NOTARY_API_KEY_ID \
+                      MACOS_NOTARY_API_ISSUER_ID MACOS_SIGNING_IDENTITY MACOS_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::'$name' is not configured on the 'macos-signing' environment."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Signing cannot proceed.  Nothing unsigned will be produced in its place."
+            echo "::error::.github/macos/README.md lists every secret and variable and how to set them."
+            exit 1
+          fi
+          echo "all signing secrets and variables are present"
+
+      - name: Checkout the signing scripts
+        # Only the signing scripts, and nothing else.  The product's source is
+        # deliberately never checked out in the privileged job: it has no use
+        # for it, and not having it there is one less thing that can run.
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: .github/macos
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve the unsigned bundle to one artifact
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/macos/*.sh
+          .github/macos/resolve-artifact.sh \
+            "${{ github.repository }}" "${{ github.run_id }}" \
+            "unsigned-${{ matrix.arch }}-${{ matrix.backend }}" >/dev/null
+
+      - name: Download the unsigned bundle from this run
+        # By id, resolved and checked above, so this cannot pick up a different
+        # artifact that happens to share the name.
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ steps.artifact.outputs.id }}
+          path: incoming
+          merge-multiple: true
+
+      - name: Verify the provenance of what was downloaded
+        id: provenance
+        run: |
+          set -euo pipefail
+          chmod +x .github/macos/*.sh
+          .github/macos/verify-provenance.sh \
+            incoming/provenance.json \
+            --attempt "${{ github.run_attempt }}" \
+            "repository=${{ github.repository }}" \
+            "run_id=${{ github.run_id }}" \
+            "sha=${{ needs.resolve.outputs.sha }}" \
+            "arch=${{ matrix.arch }}" \
+            "backend=${{ matrix.backend }}" \
+            "kind=bundle" \
+            "revision_id=${{ needs.resolve.outputs.revision_id }}" \
+            "distribution_ok=${{ needs.resolve.outputs.distribution_ok }}" \
+            "not_for_distribution=${{ needs.resolve.outputs.not_for_distribution }}"
+          s=$(/usr/bin/plutil -extract symlinks raw -o - incoming/provenance.json)
+          echo "symlinks=$s" >> "$GITHUB_OUTPUT"
+
+      - name: Unpack the unsigned payload
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          /usr/bin/ditto -x -k \
+            "incoming/simutrans-extended-${{ matrix.arch }}-${{ matrix.backend }}-unsigned.zip" work
+          ls -l work work/simutrans
+
+      # Runs before the keychain exists, so a payload that fails this is
+      # rejected while the Developer ID is still nowhere near the machine.
+      - name: Check the payload before loading the signing identity
+        run: |
+          set -euo pipefail
+          # allow-data-siblings, not strict: for Extended the data has to sit
+          # beside the bundle or the game cannot find it.  What the mode still
+          # forbids is the thing that actually matters - any Mach-O outside
+          # the bundle, which would ship as unsigned, unstapled code.
+          .github/macos/check-payload.sh work simutrans/simutrans-extended.app allow-data-siblings
+
+      # ---------------------------------------------------------------------
+      # The retention contract, checked BEFORE the identity is loaded.
+      #
+      # With retention=required, a key that is missing or cannot open what it
+      # encrypts stops the run here - before anything is signed.  Turning that
+      # into a warning and carrying on is what produced, in Standard, a signed
+      # bundle that could not be kept.
+      # ---------------------------------------------------------------------
+      - name: Check the archive can be preserved
+        env:
+          MACOS_ARTIFACT_KEY: ${{ secrets.MACOS_ARTIFACT_KEY }}
+          RETENTION: ${{ needs.resolve.outputs.retention }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/macos/*.sh
+          # shellcheck source=/dev/null
+          . .github/macos/artifact-lib.sh
+          if [ "$RETENTION" = "required" ]; then
+            if ! artifact_selftest; then
+              echo "::error::retention is set to 'required' and the archive cannot be preserved."
+              echo "::error::Stopping before the signing identity is loaded.  Nothing has been"
+              echo "::error::signed.  Configure MACOS_ARTIFACT_KEY, or run again with"
+              echo "::error::retention=none and accept that a late verdict will be unusable."
+              exit 1
+            fi
+          else
+            echo "::warning::retention=none: the signed archive will not outlive this runner."
+            if artifact_key_present; then
+              echo "::warning::A key IS configured; retention=none ignores it deliberately."
+            fi
+          fi
+
+      - name: Create the temporary keychain
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_P12_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: .github/macos/keychain.sh setup
+
+      - name: Sign
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: .github/macos/sign.sh work/simutrans/simutrans-extended.app
+
+      # ---------------------------------------------------------------------
+      # Preserve the signed archive BEFORE submitting it.
+      #
+      # The order is the point.  In Standard, on 2026-09-08, a bundle was
+      # signed and submitted, the run ended before Apple answered, and the
+      # signed bytes went with the runner - so a later acceptance had nothing
+      # left to staple.  Preserving after the submit would leave the same gap
+      # for a run that dies in between.
+      # ---------------------------------------------------------------------
+      - name: Build the archive to submit
+        run: |
+          set -euo pipefail
+          # Only the bundle is submitted.  The data beside it is not code, is
+          # not signed and is not something the notary service has any opinion
+          # about; and Apple does not staple zip archives, so the ticket goes
+          # onto the .app and the distribution archive is rebuilt afterwards.
+          /usr/bin/ditto -c -k --keepParent \
+            work/simutrans/simutrans-extended.app "${RUNNER_TEMP}/notarize.zip"
+
+      - name: Preserve the signed archive
+        id: preserve
+        env:
+          MACOS_ARTIFACT_KEY: ${{ secrets.MACOS_ARTIFACT_KEY }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          SIMU_PRODUCT_SHA: ${{ needs.resolve.outputs.sha }}
+          SIMU_WORKFLOW_SHA: ${{ github.sha }}
+          SIMU_REVISION_ID: ${{ needs.resolve.outputs.revision_id }}
+          SIMU_ARCH: ${{ matrix.arch }}-${{ matrix.backend }}
+          SIMU_NOT_FOR_DISTRIBUTION: ${{ needs.resolve.outputs.not_for_distribution }}
+          RETENTION: ${{ needs.resolve.outputs.retention }}
+        run: |
+          set -euo pipefail
+          if [ "$RETENTION" != "required" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::retention=none: not preserving the signed archive."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          .github/macos/preserve-artifact.sh "${RUNNER_TEMP}/notarize.zip" preserved
+
+      - name: Upload the preserved archive
+        if: steps.preserve.outputs.enabled == 'true'
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signed-bundle-${{ matrix.arch }}-${{ matrix.backend }}
+          path: preserved/
+          retention-days: 7
+          if-no-files-found: error
+
+      # The upload is the part that cannot be checked in advance, so it is
+      # checked here: the artifact has to actually exist, with a size, before
+      # anything is sent to Apple.
+      - name: Confirm the archive really was stored
+        if: steps.preserve.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="signed-bundle-${{ matrix.arch }}-${{ matrix.backend }}"
+          found=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"$name\" and .expired == false) | .size_in_bytes" | head -1)
+          if [ -z "$found" ] || [ "$found" -le 0 ]; then
+            echo "::error::the preserved archive is not retrievable from this run."
+            echo "::error::retention is 'required', so nothing will be submitted: a submission"
+            echo "::error::whose archive was not stored is exactly the situation that leaves a"
+            echo "::error::verdict with nothing to staple."
+            exit 1
+          fi
+          echo "artifact '$name' stored, $found bytes"
+
+      - name: Notarize and staple
+        id: notarize
+        env:
+          MACOS_NOTARY_API_KEY_P8: ${{ secrets.MACOS_NOTARY_API_KEY_P8 }}
+          MACOS_NOTARY_API_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          MACOS_NOTARY_API_ISSUER_ID: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+        run: |
+          .github/macos/notarize.sh "${RUNNER_TEMP}/notarize.zip" \
+            work/simutrans/simutrans-extended.app
+
+      # Runs even when notarization did not finish: a submission still in
+      # progress is exactly the case this record exists for.
+      - name: Bind the submission to the preserved archive
+        if: always() && steps.preserve.outputs.enabled == 'true' && steps.notarize.outputs.submission_id != ''
+        env:
+          # Without this the step cannot open the container it is binding to.
+          MACOS_ARTIFACT_KEY: ${{ secrets.MACOS_ARTIFACT_KEY }}
+        run: .github/macos/bind-submission.sh preserved "${{ steps.notarize.outputs.submission_id }}" binding
+
+      - name: Upload the submission binding
+        if: always() && steps.preserve.outputs.enabled == 'true' && steps.notarize.outputs.submission_id != ''
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: submission-${{ matrix.arch }}-${{ matrix.backend }}
+          path: binding/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Build the distribution archive
+        id: archive
+        env:
+          NOT_FOR_DISTRIBUTION: ${{ needs.resolve.outputs.not_for_distribution }}
+          REVISION_ID: ${{ needs.resolve.outputs.revision_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # A rehearsal is signed and notarized for real, so the file has to
+          # say what it is.  Naming it like a release archive is how a
+          # rehearsal ends up shipped by mistake.  The name is a label, not a
+          # cryptographic restriction: the signature is the same either way.
+          base="simutrans-extended-macos-${{ matrix.arch }}-${{ matrix.backend }}-${REVISION_ID}"
+          if [ "$NOT_FOR_DISTRIBUTION" = "true" ]; then
+            name="$base-REHEARSAL-NOT-FOR-DISTRIBUTION.zip"
+          else
+            name="$base-signed.zip"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          # The stapled bundle and the data it needs, in one directory called
+          # simutrans/ - the same shape the existing macos.zip unpacks to.
+          /usr/bin/ditto -c -k --keepParent work/simutrans "dist/$name"
+          ls -l dist
+
+      - name: Verify the archive that would be shipped
+        run: |
+          set -euo pipefail
+          .github/macos/verify.sh \
+            "dist/${{ steps.archive.outputs.name }}" \
+            "${{ matrix.arch }}" \
+            "${{ steps.provenance.outputs.symlinks }}"
+
+      # The publish job runs on Linux and cannot read a Mach-O load command, so
+      # the measured floor has to travel with the archive rather than be
+      # recomputed.
+      - name: Record what this archive is
+        if: success()
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.name }}
+          ARCH: ${{ matrix.arch }}
+          BACKEND: ${{ matrix.backend }}
+          ASSET: ${{ matrix.asset }}
+          REVISION_ID: ${{ needs.resolve.outputs.revision_id }}
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          min=$(sed -n 's/^effective_min_macos=//p' incoming/bundle-facts.txt | head -1)
+          [ -n "$min" ] || { echo "::error::no effective_min_macos in bundle-facts.txt"; exit 1; }
+          [ "$min" != "unknown" ] || { echo "::error::the minimum macOS was not measured."; exit 1; }
+          {
+            echo "arch=$ARCH"
+            echo "backend=$BACKEND"
+            echo "asset=$ASSET"
+            echo "min_macos=$min"
+            echo "revision_id=$REVISION_ID"
+            # Carried beside the archive because the publish job does not
+            # reference the environment - which is exactly what stops it being
+            # able to read a signing secret - and so cannot read this variable
+            # itself.  In Standard this field was published empty for the same
+            # reason and never filled in.
+            echo "signed_by=$IDENTITY"
+            echo "sha256=$(shasum -a 256 "dist/$ARCHIVE" | awk '{print $1}')"
+          } > "dist/$ARCHIVE.meta"
+          cat "dist/$ARCHIVE.meta"
+
+      - name: Summarise
+        if: always()
+        env:
+          SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          PUBLISH: ${{ needs.resolve.outputs.publish }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### macOS ${{ matrix.arch }} ${{ matrix.backend }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${{ needs.resolve.outputs.sha }}\` |"
+            echo "| revision | \`${{ needs.resolve.outputs.revision_id }}\` |"
+            echo "| signed by | $SIGNING_IDENTITY |"
+            echo "| public asset | \`${{ matrix.asset }}\` |"
+            echo "| for distribution | ${{ needs.resolve.outputs.distribution_ok }} |"
+            echo "| attaches to Nightly | $PUBLISH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the signed archive
+        if: success() && (needs.resolve.outputs.publish == 'true' || inputs.upload_artifact)
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signed-${{ matrix.arch }}-${{ matrix.backend }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Destroy the temporary keychain
+        if: always()
+        run: .github/macos/keychain.sh teardown
+
+  # ---------------------------------------------------------------------------
+  # Attach the signed archives to the Nightly release.
+  #
+  # No environment, on purpose: this job must not be able to read a signing
+  # secret.  It only moves files that were already signed elsewhere.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Attach to the Nightly release
+    needs: [resolve, sign]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: macos-publish-nightly
+      cancel-in-progress: false
+    steps:
+      # ---------------------------------------------------------------------
+      # Refuse to publish a build the nightly has already moved past.
+      #
+      # Simutrans Standard compares against the tip of master.  That is the
+      # wrong question here: Extended's nightly deliberately publishes the head
+      # of the last SUCCESSFUL ci.yml run, which is often not the tip, so a
+      # correct nightly would fail that test every time the newest commit is
+      # still building.
+      #
+      # The right question for Extended is whether the Nightly tag still names
+      # the commit this run built.  check-updates moves that tag to the commit
+      # it selected before any of this starts, so a later nightly that has
+      # moved it is proof that this run is the stale one.  It also catches a
+      # re-run of an old run by hand, and a run that sat waiting on the notary
+      # service while a newer nightly went past.
+      #
+      # The check is deliberately at the last possible moment: the question is
+      # not "was this current when we started" but "is it still current now".
+      # ---------------------------------------------------------------------
+      - name: Refuse to publish over a newer nightly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILT: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/${{ github.repository }}/git/ref/tags/Nightly" --jq .object.sha)
+          # An annotated tag points at a tag object; dereference it.
+          type=$(gh api "repos/${{ github.repository }}/git/ref/tags/Nightly" --jq .object.type)
+          if [ "$type" = "tag" ]; then
+            tag=$(gh api "repos/${{ github.repository }}/git/tags/$tag" --jq .object.sha)
+          fi
+          echo "built from     : $BUILT"
+          echo "Nightly tag at : $tag"
+          if [ "$BUILT" != "$tag" ]; then
+            echo "::error::the Nightly tag has moved on since this build started."
+            echo "::error::Publishing now would replace the macOS downloads that belong to"
+            echo "::error::$tag with ones built from $BUILT."
+            echo "::error::The run that built $tag publishes; this one stops here."
+            echo "::error::Nothing is wrong with the archives - they are signed, notarized"
+            echo "::error::and stapled, and remain as artifacts of this run."
+            exit 1
+          fi
+          echo "still the nightly's commit; safe to publish"
+
+      - name: Download the signed archives
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: incoming
+          pattern: signed-*
+          merge-multiple: true
+
+      - name: Checkout the publishing scripts
+        # actions/checkout v6.1.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: .github/macos
+          sparse-checkout-cone-mode: false
+          path: ci
+
+      - name: Check every variant arrived and is what it claims
+        id: check
+        env:
+          REVISION_ID: ${{ needs.resolve.outputs.revision_id }}
+          MATRIX: ${{ needs.resolve.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          ls -l incoming
+          chmod +x ci/.github/macos/*.sh
+          # All of the deciding lives in the script, so that a deliberately
+          # wrong set of archives can be fed to it and watched to be refused.
+          # This is the one step that runs on Linux, renames files, and whose
+          # way of going wrong - shipping an archive that is not what its name
+          # says - leaves no trace in a log that reads "uploaded 4 files".
+          ci/.github/macos/collect-publish-set.sh \
+            incoming "$REVISION_ID" "$MATRIX" publish
+
+          identity=$(sed -n 's/^signed_by=//p' incoming/*.meta | head -1)
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+
+      - name: Attach them to Nightly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVISION_ID: ${{ needs.resolve.outputs.revision_id }}
+          COMMIT: ${{ needs.resolve.outputs.sha }}
+          IDENTITY: ${{ steps.check.outputs.identity }}
+        run: |
+          set -euo pipefail
+
+          # The names macOS users already download.  Taking them over is the
+          # point: a signed build nobody finds helps nobody.  --clobber is
+          # correct here and only here - a nightly asset is meant to be
+          # replaced every night, and these names belong to this workflow now
+          # that nightly.yml no longer builds macOS packages itself.
+          {
+            echo "Simutrans-Extended macOS nightly - signed, notarized and stapled"
+            echo "==============================================================="
+            echo
+            echo "Revision   $REVISION_ID"
+            echo "Commit     $COMMIT"
+            echo "Built      $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo "Run        ${{ github.repository }} run ${{ github.run_id }}"
+            echo "Signed by  $IDENTITY"
+            echo
+            while IFS=$'\t' read -r asset arch backend min sha; do
+              printf '%-24s %-8s %-5s requires macOS %s or later\n' "$asset" "$arch" "$backend" "$min"
+              printf '  sha256 %s\n' "$sha"
+            done < publish/manifest-rows.txt
+            echo
+            echo "No archive is Universal. Each holds one architecture, checked against"
+            echo "its name before it was published. macos.zip and macos-sdl2.zip are the"
+            echo "Apple Silicon builds, as they have always been; the -intel names are the"
+            echo "x86_64 builds."
+            echo
+            echo "The minimum macOS version is the highest declared by any Mach-O file in"
+            echo "the bundle, which is usually set by a bundled library rather than by"
+            echo "Simutrans-Extended itself."
+            echo
+            echo "Each archive unpacks to a folder called simutrans/ containing"
+            echo "simutrans-extended.app and the data it reads. Keep them together, and"
+            echo "put a pakset in that same folder."
+            echo
+            echo "To check a download:"
+            echo "  shasum -a 256 macos.zip"
+            echo "  spctl --assess --type execute -vv simutrans/simutrans-extended.app"
+            echo "  xcrun stapler validate simutrans/simutrans-extended.app"
+          } > publish/macos-signed.txt
+          cat publish/macos-signed.txt
+
+          # Uploaded from inside publish/, so the asset names are exactly the
+          # file names and no path leaks into them.  collect-publish-set.sh
+          # has already refused if any variant was missing, so this either
+          # replaces the whole macOS set or does not run at all.
+          cd publish
+          # shellcheck disable=SC2046
+          gh release upload Nightly \
+            $(cat publish-list.txt) \
+            macos-signed.txt \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Say what was published
+        run: |
+          set -euo pipefail
+          {
+            echo "### Published to Nightly"
+            echo
+            echo "| asset | architecture | backend | minimum macOS | sha256 |"
+            echo "|---|---|---|---|---|"
+            while IFS=$'\t' read -r asset arch backend min sha; do
+              echo "| \`$asset\` | $arch | $backend | $min | \`$sha\` |"
+            done < publish/manifest-rows.txt
+            echo
+            echo "All signed with a Developer ID, notarized, and stapled."
+            echo "Revision \`${{ needs.resolve.outputs.revision_id }}\`, commit \`${{ needs.resolve.outputs.sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
