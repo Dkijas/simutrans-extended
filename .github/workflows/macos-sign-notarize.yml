@@ -807,7 +807,10 @@ jobs:
     needs: [resolve, build-game]
     # The canonical repository only.  A fork that copies this workflow has no
     # secrets anyway, but failing here is clearer than failing at `security`.
-    if: github.repository == 'jamespetts/simutrans-extended'
+    # LAB ONLY - upstream this reads 'jamespetts/simutrans-extended'.
+    # It is the single line that decides where a Developer ID may be
+    # applied, so it names the laboratory here and nothing else does.
+    if: github.repository == 'Dkijas/simutrans-extended'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read

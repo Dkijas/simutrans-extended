@@ -1,7 +1,8 @@
 name: nightly
+# LAB ONLY - not part of the change under review.
+# Upstream also runs on a schedule (cron '0 2 * * *').  No timer fires
+# during the rehearsal: every run is started by hand.
 on:
-  schedule:
-    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -131,7 +132,10 @@ jobs:
 
   deploy-bin:
     runs-on: ${{ matrix.runner }}
-    if: needs.check-updates.outputs.outdated == 'true'
+    # LAB ONLY - disabled for the rehearsal.
+    # Linux and Windows publication is out of scope for the rehearsal.
+    # (upstream: if: needs.check-updates.outputs.outdated == 'true')
+    if: false
     needs: check-updates
     permissions:
       contents: write
@@ -259,6 +263,9 @@ jobs:
 
   update-paks:
     runs-on: ubuntu-latest
+    # LAB ONLY - disabled for the rehearsal.
+    # must never be able to dispatch into jamespetts/simutrans-pak128.britain.
+    if: false
     needs: check-updates #paksets pulling makeobj directly from the artifacts, no need to wait for deploy-bin
     strategy:
       matrix:
@@ -316,6 +323,9 @@ jobs:
   # TODO: check for changes only deploy if simutrans binaries or at least one of the paksets has changed.
   deploy-package:
     runs-on: ubuntu-latest
+    # LAB ONLY - disabled for the rehearsal.
+    # depends on the Linux and Windows assets this rehearsal does not produce.
+    if: false
     needs: [check-updates, deploy-bin, update-paks]
     permissions:
       contents: write

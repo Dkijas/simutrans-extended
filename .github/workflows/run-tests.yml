@@ -17,11 +17,9 @@
 # infrastructure stays wired and can be exercised on demand via "Run workflow" with the
 # squirrel_tests input ticked (results then report honestly - no continue-on-error).
 #
+# LAB ONLY - not part of the change under review.
+# Upstream also runs on push and pull_request for master and ex-15.
 on:
-  push:
-    branches: [master, ex-15]
-  pull_request:
-    branches: [master, ex-15]
   workflow_dispatch:
     inputs:
       squirrel_tests:

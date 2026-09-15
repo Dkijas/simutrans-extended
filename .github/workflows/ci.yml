@@ -1,5 +1,9 @@
 name: CI
-on: [push, pull_request]
+# LAB ONLY - not part of the change under review.
+# Upstream: on: [push, pull_request].  Dispatch-only here so that the
+# rehearsal controls when 13 jobs compete for the macOS runners.
+on:
+  workflow_dispatch:
 
 
 jobs:
@@ -14,9 +18,20 @@ jobs:
       - name: Code Check
         shell: bash
         run: ./cleanup_code.sh
-      - uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: run ./cleanup_code.sh
+      # LAB ONLY - the upstream job commits the result back with
+      # stefanzweifel/git-auto-commit-action@v5 and contents: write.  Here it
+      # only reports, so the formatter can never rewrite the candidate being
+      # rehearsed.  Upstream behaviour is unchanged in the reviewed patch.
+      - name: Report formatting drift without committing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::warning::cleanup_code.sh changed files; NOT committing them in the lab."
+            git --no-pager diff --stat
+          else
+            echo "no formatting drift"
+          fi
 
 
   simutrans-linux-sdl2:

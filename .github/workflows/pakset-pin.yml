@@ -15,9 +15,10 @@
 # job triplets). The file is identical on master and ex-15.
 #
 name: Pakset pin updater
+# LAB ONLY - not part of the change under review.
+# Upstream also runs on a schedule (cron '30 3 * * *').  No timer fires
+# during the rehearsal.
 on:
-  schedule:
-    - cron: '30 3 * * *'
   workflow_dispatch:
 
 concurrency:

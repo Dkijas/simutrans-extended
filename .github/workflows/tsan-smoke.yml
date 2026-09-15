@@ -13,11 +13,9 @@
 # enlarged timeouts.
 #
 name: TSan smoke
+# LAB ONLY - not part of the change under review.
+# Upstream also runs on push and pull_request for master and ex-15.
 on:
-  push:
-    branches: [master, ex-15]
-  pull_request:
-    branches: [master, ex-15]
   workflow_dispatch:
 
 jobs:
