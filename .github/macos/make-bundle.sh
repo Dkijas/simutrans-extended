@@ -304,21 +304,31 @@ bundle_binary() {
 	done <<< "$deps"
 }
 
-# Drop the build machine's search paths from one Mach-O file.
+# Drop EVERY LC_RPATH from one Mach-O file.
 #
-# They cannot resolve to anything on a user's Mac, and leaving them behind is
-# not merely untidy: a library of the right name sitting in /usr/local/lib on
-# the user's machine would be found through one of them in preference to the
-# signed copy inside the bundle.
+# An LC_RPATH is consulted for one purpose only: resolving a dependency whose
+# name begins with @rpath/.  By the time this runs, every such dependency has
+# been rewritten to @loader_path or @executable_path, which is asserted below
+# before a single entry is removed.  With no @rpath/ dependency left, every
+# LC_RPATH is dead, and dead search paths are not harmless:
 #
-# -delete_rpath removes one entry at a time and the same path can be present
-# more than once, so each is removed until the tool says there is no more.
-strip_build_rpaths() {
+#   * an absolute one (/opt/homebrew/lib, /usr/local/lib) would let a library
+#     of the right name on the user's machine be found in preference to the
+#     signed copy inside the bundle;
+#   * a relative one can escape the bundle just as effectively.  The first
+#     rehearsal, on 2026-09-15, shipped libSDL2-2.0.0.dylib still carrying
+#     @loader_path/../../../../opt/sdl3/lib - a Homebrew bottle's own relative
+#     path, which from Contents/Frameworks/ resolves outside the application
+#     entirely.  An earlier version of this function only removed entries that
+#     did not start with '@', so that one survived.
+#
+# -delete_rpath removes one entry at a time and the same path can appear more
+# than once, so each is removed until none is left.
+strip_all_rpaths() {
 	local f="$1"
-	local rp before
+	local rp
 	while :; do
-		before=$(list_rpaths "$f")
-		rp=$(grep -vE '^@' <<<"$before" | head -1 || true)
+		rp=$(list_rpaths "$f" | head -1)
 		[ -n "$rp" ] || break
 		install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || {
 			echo "::error::cannot remove LC_RPATH '$rp' from $f"
@@ -334,10 +344,35 @@ for bin in "$GAME" "${TOOLS[@]}"; do
 done
 echo "   libraries in Contents/Frameworks: $(find "$fw_dir" -type f | wc -l | tr -d ' ')"
 
-echo "-- removing build-machine search paths"
+# Every LC_RPATH is about to be removed, so first prove none is still needed.
+# An @rpath/ dependency surviving here would mean the rewriting above missed
+# something, and removing the search paths would turn that into a library that
+# cannot be found at all on a user's Mac.
+echo "-- checking no @rpath dependency survived the rewriting"
+left=0
+while IFS= read -r -d '' f; do
+	file -b "$f" | grep -q 'Mach-O' || continue
+	deps=$(otool -L "$f" | awk 'NR>1 {print $1}')
+	while read -r d; do
+		case "$d" in
+			@rpath/*)
+				echo "::error::${f#"$app"/} still depends on $d"
+				left=$((left + 1))
+				;;
+		esac
+	done <<< "$deps"
+done < <(find "$app" -type f -print0)
+if [ "$left" -gt 0 ]; then
+	echo "::error::$left @rpath dependency/dependencies were not rewritten."
+	echo "::error::Refusing to remove the search paths that still resolve them."
+	exit 1
+fi
+echo "   none: every dependency is @loader_path, @executable_path, /usr/lib or /System"
+
+echo "-- removing every now-dead search path"
 while IFS= read -r -d '' f; do
 	if file -b "$f" | grep -q 'Mach-O'; then
-		strip_build_rpaths "$f"
+		strip_all_rpaths "$f"
 	fi
 done < <(find "$app" -type f -print0)
 
@@ -429,9 +464,13 @@ while IFS= read -r -d '' f; do
 		otool -L "$f"
 		bad=$((bad + 1))
 	fi
+	# No LC_RPATH at all, not merely no absolute one.  Checking only for
+	# /opt/homebrew and /usr/local is what let a Homebrew bottle's own
+	# @loader_path/../../../../opt/sdl3/lib through in the first rehearsal.
 	rp=$(list_rpaths "$f")
-	if grep -qE '^(/opt/homebrew|/usr/local)' <<<"$rp"; then
-		echo "::error::$f still carries a build-machine LC_RPATH: $rp"
+	if [ -n "$rp" ]; then
+		echo "::error::${f#"$app"/} still carries an LC_RPATH:"
+		printf '%s\n' "$rp" | sed 's/^/::error::  /'
 		bad=$((bad + 1))
 	fi
 done < <(find "$app" -type f -print0)
@@ -440,7 +479,8 @@ if [ "$bad" -gt 0 ]; then
 	echo "::error::$bad file(s) would not run outside the build machine."
 	exit 1
 fi
-echo "   every Mach-O resolves inside the bundle or in /usr/lib and /System"
+echo "   every Mach-O resolves inside the bundle or in /usr/lib and /System,"
+echo "   and none carries a search path any more"
 
 echo
 echo "payload assembled at $payload"
