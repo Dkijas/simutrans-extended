@@ -84,9 +84,22 @@ jobs:
           set -euo pipefail
           repo="${{ github.repository }}"
           if gh release view Nightly --repo "$repo" >/dev/null 2>&1; then
+            # LAB ONLY: modifying an EXISTING release returns 403 in this
+            # fork, and inconsistently - a raw PATCH on one release id
+            # succeeded at 05:49 and gh release edit on another failed at
+            # 05:55, with the same token and Contents: write throughout.
+            # Creating a release, moving the tag ref and uploading assets
+            # all work here. The title and target are cosmetic for the
+            # rehearsal, so a refusal is logged and the run continues:
+            # everything downstream only needs the release to exist.
+            # Upstream keeps ncipollo and does not hit this.
             echo "updating the existing Nightly release"
-            gh release edit Nightly --repo "$repo" \
-              --title "Nightly #$SHORT_SHA" --target "$LATEST_SHA"
+            if ! gh release edit Nightly --repo "$repo" \
+                 --title "Nightly #$SHORT_SHA" --target "$LATEST_SHA"; then
+              echo "::warning::could not edit the release in this fork (403);"
+              echo "::warning::continuing - the release exists, which is all"
+              echo "::warning::the rest of the rehearsal needs."
+            fi
           else
             echo "creating the Nightly release"
             gh release create Nightly --repo "$repo" \
