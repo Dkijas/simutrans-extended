@@ -1,16 +1,18 @@
 #
 # LAB ONLY - not part of the change under review. Delete before delivery.
 #
-# ncipollo/release-action@v1 fails with
-#   Error 403: Resource not accessible by integration
-# on both create and update, while the job's GITHUB_TOKEN reports
-# Contents: write and a hand-rolled POST/PATCH to the same endpoints
-# succeeds (201/200).  So it is something in the action's payload, not the
-# permission.
+# Narrowing the ncipollo 403.  Established so far, all measured:
+#   * the job's GITHUB_TOKEN has Contents: write;
+#   * POST /releases with every field ncipollo sends returns 201 - for the
+#     tag name "lab-probe-tag";
+#   * GET /immutable-releases returns 403 for GITHUB_TOKEN, but ncipollo's
+#     error names create-a-release, not that endpoint;
+#   * ncipollo v1.21.0 is six months old and upstream's nightly succeeded
+#     with the same @v1 the day before, so it is not a new action.
 #
-# This sends create payloads of increasing completeness and reports the HTTP
-# status of each, so the offending field names itself instead of being
-# guessed at.
+# The one untested difference is the tag itself: "Nightly" already exists in
+# this fork and was inherited from the parent when the fork was made, whereas
+# "lab-probe-tag" was created fresh by the probe.
 #
 name: LAB diagnose release 403
 
@@ -26,55 +28,51 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Which field is refused?
+      - name: Is it the tag name?
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
 
-          created=""
-
-          try() {
-            # try <label> <json>
-            local label=$1 body=$2 code id
+          post() {
+            local label=$1 body=$2 code
             code=$(printf '%s' "$body" | curl -s -o /tmp/out.json -w '%{http_code}' \
               -X POST -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$REPO/releases" -d @-)
-            printf '%-52s %s\n' "$label" "$code"
-            if [ "$code" -ge 400 ]; then
-              jq -r '"      " + (.message // "?")' < /tmp/out.json
-            else
-              id=$(jq -r .id < /tmp/out.json)
-              curl -s -o /dev/null -X DELETE \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/$REPO/releases/$id"
-            fi
-            curl -s -o /dev/null -X DELETE \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/git/refs/tags/lab-probe-tag"
+            printf '%-46s %s\n' "$label" "$code"
+            jq -r '"      " + (.message // ("id=" + (.id|tostring)))' < /tmp/out.json
           }
 
-          T='"tag_name":"lab-probe-tag","target_commitish":"master"'
+          sha=$(git ls-remote "https://github.com/$REPO" refs/heads/master | cut -f1)
+          echo "master: $sha"
+          echo
 
-          echo "=== create, one field added at a time"
-          try "minimal"                          "{$T}"
-          try "+ name"                           "{$T,\"name\":\"probe\"}"
-          try "+ body"                           "{$T,\"name\":\"probe\",\"body\":\"\"}"
-          try "+ draft/prerelease"               "{$T,\"name\":\"probe\",\"body\":\"\",\"draft\":false,\"prerelease\":false}"
-          try "+ generate_release_notes:false"   "{$T,\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"generate_release_notes\":false}"
-          try "+ make_latest:legacy"             "{$T,\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"make_latest\":\"legacy\"}"
-          try "+ make_latest:true"               "{$T,\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"make_latest\":\"true\"}"
-          try "+ immutable:false"                "{$T,\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"immutable\":false}"
-          try "+ discussion_category_name:\"\""  "{$T,\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"discussion_category_name\":\"\"}"
+          echo "=== the tag that already exists, inherited from the parent fork"
+          post "tag_name=Nightly" \
+            "{\"tag_name\":\"Nightly\",\"target_commitish\":\"$sha\",\"name\":\"Nightly probe\",\"draft\":false,\"prerelease\":false,\"make_latest\":\"legacy\"}"
 
           echo
-          echo "=== what the repository says about releases"
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/immutable-releases" | jq . || true
+          echo "=== a tag that does not exist yet, same payload otherwise"
+          post "tag_name=lab-fresh-tag" \
+            "{\"tag_name\":\"lab-fresh-tag\",\"target_commitish\":\"$sha\",\"name\":\"probe\",\"draft\":false,\"prerelease\":false,\"make_latest\":\"legacy\"}"
+          fresh=$(jq -r '.id // empty' < /tmp/out.json)
+          if [ -n "$fresh" ]; then
+            curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/$fresh"
+            curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/git/refs/tags/lab-fresh-tag"
+          fi
+
           echo
-          echo "=== and about discussions / features"
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO" \
-            | jq '{has_discussions, has_issues, fork, archived, disabled}' || true
+          echo "=== can the token read and write the Nightly TAG ref itself?"
+          curl -s -o /tmp/r.json -w '  GET  ref/tags/Nightly   %{http_code}\n' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/Nightly"
+          jq -r '"      " + ((.object.sha // .message))' < /tmp/r.json
+          printf '{"sha":"%s","force":true}' "$sha" | curl -s -o /tmp/p.json \
+            -w '  PATCH refs/tags/Nightly  %{http_code}\n' \
+            -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/git/refs/tags/Nightly" -d @-
+          jq -r '"      " + ((.object.sha // .message))' < /tmp/p.json
