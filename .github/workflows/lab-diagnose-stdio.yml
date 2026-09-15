@@ -57,6 +57,7 @@ jobs:
           #include <limits.h>
           #include <stdint.h>
           #include <stddef.h>
+          #include <iterator>   // via utils/for.h, which simtypes.h includes
           #include <cassert>
           bool takes_a_file(FILE *f);
           int main() { return 0; }
