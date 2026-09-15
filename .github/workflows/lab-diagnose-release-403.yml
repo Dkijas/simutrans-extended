@@ -1,0 +1,91 @@
+#
+# LAB ONLY - not part of the change under review. Delete before delivery.
+#
+# check-updates fails with
+#   Error 403: Resource not accessible by integration
+# on update-a-release, while the job's GITHUB_TOKEN reports Contents: write.
+#
+# Candidates, to be separated rather than guessed at:
+#   a) reading the release at all,
+#   b) changing its name,
+#   c) changing its target_commitish, which is what ncipollo does when the
+#      nightly moves to a new commit, and which GitHub may refuse on a
+#      release that is already published,
+#   d) creating a release for a new tag.
+#
+# Each is attempted on its own and its HTTP status reported.  Nothing here
+# depends on the previous step succeeding.
+#
+name: LAB diagnose release 403
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Probe each call separately
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          say() { printf '\n=== %s\n' "$1"; }
+
+          call() {
+            # call <label> <method> <path> [json]
+            local label=$1 method=$2 path=$3 body=${4:-}
+            local code
+            if [ -n "$body" ]; then
+              code=$(printf '%s' "$body" | curl -s -o /tmp/out.json -w '%{http_code}' \
+                -X "$method" -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/$path" -d @-)
+            else
+              code=$(curl -s -o /tmp/out.json -w '%{http_code}' \
+                -X "$method" -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/$path")
+            fi
+            printf '%-46s %s\n' "$label" "$code"
+            if [ "$code" -ge 400 ]; then
+              sed 's/^/    /' /tmp/out.json | head -6
+            fi
+          }
+
+          say "a) read the release"
+          call "GET releases/tags/Nightly" GET "repos/$REPO/releases/tags/Nightly"
+          id=$(jq -r .id < /tmp/out.json)
+          echo "release id: $id"
+
+          say "b) change only the name"
+          call "PATCH name" PATCH "repos/$REPO/releases/$id" '{"name":"Nightly probe name"}'
+
+          say "c) change only the target_commitish"
+          sha=$(git ls-remote "https://github.com/$REPO" refs/heads/master | cut -f1)
+          call "PATCH target_commitish" PATCH "repos/$REPO/releases/$id" \
+            "{\"target_commitish\":\"$sha\"}"
+
+          say "d) create a release for a throwaway tag"
+          call "POST create lab-probe-tag" POST "repos/$REPO/releases" \
+            '{"tag_name":"lab-probe-tag","name":"probe","target_commitish":"master"}'
+          probe_id=$(jq -r '.id // empty' < /tmp/out.json)
+
+          say "e) delete that throwaway release again"
+          if [ -n "$probe_id" ]; then
+            call "DELETE the probe release" DELETE "repos/$REPO/releases/$probe_id"
+            call "DELETE the probe tag" DELETE "repos/$REPO/git/refs/tags/lab-probe-tag"
+          else
+            echo "not created, nothing to delete"
+          fi
+
+          say "f) put the real release name back"
+          call "PATCH name back" PATCH "repos/$REPO/releases/$id" \
+            '{"name":"Nightly #cd5701302"}'
