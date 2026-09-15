@@ -10,6 +10,7 @@
 #include "../simtypes.h"
 
 #include <cassert>
+#include <cstdio> // FILE, used in the interface below
 
 
 /**

@@ -1,0 +1,95 @@
+#
+# LAB ONLY - not part of the change under review. Delete before delivery.
+#
+# Why does io/raw_image.h compile on macos-latest and not on macos-15?
+#
+# raw_image.h names FILE in its interface and includes only ../simtypes.h and
+# <cassert>.  Whether that compiles depends entirely on something else
+# dragging <stdio.h> in.  Two candidates, and they need separating before
+# either is written down as the cause:
+#
+#   a) the runner image - macos-15 is Xcode 16.4 / SDK 15.5, macos-latest is
+#      a macOS 26 image with a newer toolchain;
+#   b) CMAKE_OSX_DEPLOYMENT_TARGET=13.0, which this workflow introduced and
+#      which changes availability macros in libc++.
+#
+# This compiles a three-line translation unit that mimics raw_image.h exactly,
+# across both images and with and without the deployment target, and reports
+# which combinations see FILE.
+#
+name: LAB diagnose stdio transitive include
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} target=${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel, macos-latest]
+        target: ['none', '13.0']
+    steps:
+      - name: Report the toolchain
+        run: |
+          set -euo pipefail
+          {
+            echo "image    : ${{ matrix.runner }}"
+            echo "arch     : $(uname -m)"
+            echo "macOS    : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            echo "Xcode    : $(xcodebuild -version | tr '\n' ' ')"
+            echo "SDK      : $(xcrun --show-sdk-version)"
+            echo "clang    : $(clang --version | head -1)"
+          } | tee toolchain.txt
+
+      - name: Does <cassert> bring in FILE?
+        run: |
+          set -euo pipefail
+          cat > probe.cc <<'EOF'
+          // Exactly what io/raw_image.h relies on: <cassert> only.
+          #include <climits>
+          #include <stdlib.h>
+          #include <limits.h>
+          #include <stdint.h>
+          #include <stddef.h>
+          #include <cassert>
+          bool takes_a_file(FILE *f);
+          int main() { return 0; }
+          EOF
+
+          flags="-std=c++14"
+          if [ "${{ matrix.target }}" != "none" ]; then
+            flags="$flags -mmacosx-version-min=${{ matrix.target }}"
+          fi
+          echo "flags: $flags"
+
+          if clang++ $flags -fsyntax-only probe.cc 2>err.txt; then
+            verdict="FILE IS VISIBLE without <cstdio>"
+          else
+            verdict="FILE IS NOT VISIBLE without <cstdio>"
+            head -5 err.txt
+          fi
+          echo "$verdict"
+
+          # And the same TU with the fix, which must compile everywhere.
+          sed -i '' 's|#include <cassert>|#include <cassert>\n#include <cstdio>|' probe.cc
+          if clang++ $flags -fsyntax-only probe.cc; then
+            fixed="with <cstdio>: compiles"
+          else
+            fixed="with <cstdio>: STILL FAILS"
+          fi
+          echo "$fixed"
+
+          {
+            echo "### ${{ matrix.runner }}, deployment target ${{ matrix.target }}"
+            echo
+            sed 's/^/    /' toolchain.txt
+            echo
+            echo "- $verdict"
+            echo "- $fixed"
+          } >> "$GITHUB_STEP_SUMMARY"
