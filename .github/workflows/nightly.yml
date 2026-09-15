@@ -51,36 +51,50 @@ jobs:
             echo "Nightly #$latest_short_sha is up to date. Skipping following tasks"
 
       #TODO If the nightly tag is up-to-date but there is no release (delete manually?) We won't create a new one.
+      # LAB ONLY - upstream this step is:
+      #
+      #   - uses: ncipollo/release-action@v1
+      #     with:
+      #       allowUpdates: true
+      #       artifactErrorsFailBuild: true
+      #       commit: "${{ env.latest_sha }}"
+      #       name: "Nightly #${{ env.latest_short_sha }}"
+      #       removeArtifacts: false
+      #       tag: "Nightly"
+      #       token: ${{ secrets.GITHUB_TOKEN }}
+      #
+      # That action returns 403 "Resource not accessible by integration" in
+      # this fork, while the same GITHUB_TOKEN performs every underlying REST
+      # call by hand (POST /releases 201, PATCH 200, DELETE 204, tag ref PATCH
+      # 200). The only endpoint the token cannot reach here is
+      # GET /immutable-releases, which such an action must consult.
+      #
+      # It is not a defect in the change under review: ncipollo v1.21.0 is six
+      # months old and jamespetts/simutrans-extended ran the identical @v1
+      # successfully the day before this rehearsal. This replacement exists
+      # only so the rest of the nightly can be exercised here, and it must not
+      # reach the production patch.
       - name: Release files
         if: env.outdated == 'true'
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          artifactErrorsFailBuild: true
-          commit: "${{ env.latest_sha }}"
-          name: "Nightly #${{ env.latest_short_sha }}"
-          # removeArtifacts was true, which deleted every asset here and let
-          # each deploy job put its own back.  For a job that always succeeds
-          # that is the same thing as overwriting.  For one that can fail it is
-          # not: the asset simply disappears, and there is nothing to download
-          # until the next night.
-          #
-          # macOS signing can fail for reasons that have nothing to do with
-          # this project - the Apple notary service rejecting or stalling - and
-          # the whole point of publishing only what is signed is that nothing
-          # unsigned goes out in its place.  Deleting yesterday's signed
-          # download as well would turn "no new build today" into "no build at
-          # all", which is strictly worse for users and was never the intent.
-          #
-          # Every publisher below already replaces its own asset by name
-          # (upload-release-action with overwrite: true, gh release upload
-          # --clobber), so nothing goes stale in the normal case.  The one
-          # thing removeArtifacts did that overwriting does not is clear away
-          # names that are no longer produced at all, and the step after this
-          # does exactly that, from an explicit list.
-          removeArtifacts: false
-          tag: "Nightly"
-          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_SHA: ${{ env.latest_sha }}
+          SHORT_SHA: ${{ env.latest_short_sha }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          if gh release view Nightly --repo "$repo" >/dev/null 2>&1; then
+            echo "updating the existing Nightly release"
+            gh release edit Nightly --repo "$repo" \
+              --title "Nightly #$SHORT_SHA" --target "$LATEST_SHA"
+          else
+            echo "creating the Nightly release"
+            gh release create Nightly --repo "$repo" \
+              --title "Nightly #$SHORT_SHA" --target "$LATEST_SHA" \
+              --notes "Laboratory rehearsal release. Not a distribution."
+          fi
+          gh release view Nightly --repo "$repo" --json name,targetCommitish \
+            --jq '"  now: \(.name) at \(.targetCommitish)"'
 
       # The part of removeArtifacts worth keeping: an asset whose name this
       # workflow no longer produces should not sit on the release for ever.
