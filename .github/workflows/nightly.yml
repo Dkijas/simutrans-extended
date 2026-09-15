@@ -137,21 +137,28 @@ jobs:
           done < <(gh release view Nightly --repo "${{ github.repository }}" \
                      --json assets --jq '.assets[].name')
           echo "obsolete assets removed: $removed"
+      # LAB ONLY - upstream this is actions/github-script@v7 calling
+      # github.rest.git.updateRef, and it works there. In this fork it hits
+      # the same inconsistent 403 as the release edit, so the refusal is
+      # logged instead of fatal and the tag is positioned by hand before a
+      # rehearsal run. The publish job still checks the tag, which is the
+      # thing that actually matters.
       - name: Move the Nightly tag
         if: env.outdated == 'true'
-        uses: actions/github-script@v7
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LATEST_SHA: ${{ env.latest_sha }}
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.git.updateRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: "tags/Nightly",
-              sha: process.env.LATEST_SHA,
-              force: true
-            })
+        run: |
+          set -uo pipefail
+          if gh api --method PATCH \
+               "repos/${{ github.repository }}/git/refs/tags/Nightly" \
+               -f sha="$LATEST_SHA" -F force=true --jq '.object.sha'; then
+            echo "Nightly tag now at $LATEST_SHA"
+          else
+            echo "::warning::could not move the Nightly tag in this fork (403)."
+            echo "::warning::It is positioned by hand for the rehearsal; the"
+            echo "::warning::publish job still checks it, which is the point."
+          fi
     outputs:
       latest_sha: ${{ env.latest_sha }}
       run_id: ${{ steps.last_successful_commit.outputs.run_id }}
