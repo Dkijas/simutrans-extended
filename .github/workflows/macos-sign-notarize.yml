@@ -1329,15 +1329,63 @@ jobs:
           } > publish/macos-signed.txt
           cat publish/macos-signed.txt
 
+          # WHAT IS AND IS NOT GUARANTEED HERE.
+          #
+          # This is NOT atomic, and saying otherwise would be a claim the API
+          # does not support.  `gh release upload` replaces one asset per REST
+          # call and there is no transaction across four of them; a run that
+          # dies between the second and the third leaves two new archives
+          # beside two old ones.
+          #
+          # What IS guaranteed:
+          #
+          #   * collect-publish-set.sh has already refused unless all four
+          #     variants are present, signed, stapled and consistent with
+          #     their names, so the uploads never begin for a partial set -
+          #     which is the only partial state anything upstream of here can
+          #     produce.
+          #   * the archives go first and macos-signed.txt goes LAST, in a
+          #     separate call.  That file is the only thing stating which
+          #     commit and which hashes the macOS downloads correspond to, so
+          #     until every archive is in place it still describes the
+          #     PREVIOUS set, and a reader comparing its hashes against the
+          #     files can see the mismatch.  A partial upload is detectable
+          #     rather than silent.
+          #   * the next nightly replaces all four again.
+          #
           # Uploaded from inside publish/, so the asset names are exactly the
-          # file names and no path leaks into them.  collect-publish-set.sh
-          # has already refused if any variant was missing, so this either
-          # replaces the whole macOS set or does not run at all.
+          # file names and no path leaks into them.
           cd publish
+
           # shellcheck disable=SC2046
           gh release upload Nightly \
             $(cat publish-list.txt) \
-            macos-signed.txt \
+            --repo "${{ github.repository }}" --clobber
+
+          # Every archive must be on the release, at the size it has here,
+          # before the file that describes them is allowed to change.
+          incomplete=0
+          while read -r asset; do
+            [ -n "$asset" ] || continue
+            want=$(stat -c %s "$asset")
+            got=$(gh release view Nightly --repo "${{ github.repository }}" \
+              --json assets --jq ".assets[] | select(.name == \"$asset\") | .size")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$asset is '${got:-absent}' bytes on the release, expected $want"
+              incomplete=$((incomplete + 1))
+            else
+              echo "  $asset confirmed on the release ($got bytes)"
+            fi
+          done < publish-list.txt
+          if [ "$incomplete" -gt 0 ]; then
+            echo "::error::$incomplete archive(s) did not arrive intact."
+            echo "::error::macos-signed.txt is NOT being replaced, so it still describes"
+            echo "::error::the previous set and the mismatch is visible to anyone who"
+            echo "::error::checks it.  The next nightly republishes all four."
+            exit 1
+          fi
+
+          gh release upload Nightly macos-signed.txt \
             --repo "${{ github.repository }}" --clobber
 
       - name: Say what was published
